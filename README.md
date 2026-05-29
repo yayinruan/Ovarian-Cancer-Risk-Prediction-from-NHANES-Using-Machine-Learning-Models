@@ -1,5 +1,7 @@
 # Ovarian-Cancer-Risk-Prediction-from-NHANES-Using-Machine-Learning-Models
 Developed a machine learning pipeline and models in R to predict ovarian cancer risk using 30 years of population-level NHANES (1988 - 2018) data with 100,000+ participants
+
+
 Key Findings:
 The gradient boosting model was the best performing alogrithm from the three algorithms analyzed in this project (logistic regression, random forest, and gradient boosting ) because it has the highest PR-AUC (metric that measures accuracy less affected by imbalanced dataset than ROC-AUC) and higher sensitivity in comparison to random forest that has the same PR-AUC performance. From the GBM, the three main predictors of ovarian cancer is age, waist circumference, and menopause, and all 10 predictors included are significant. When evaluated in the testing dataset, the PR-AUC (0.0150) is much lower than the training PR-AUC (0.9975), however sensitivity remain around the same ~0.60, which means it has 60% chance of identifying true positives (ovarian cancers). Additionally, the balanced accuracy is greater than 50% (balanced accuracy = 63.72%), this indicates at the minimum the test performs better than random chances in distinguishing women at high risk from those not at risk of ovarian cancer given the predictors. Additionally, the GBM model when evaluated had 60% sensitivity, indicating the model has a 60% chance in identifying true positives.
 
