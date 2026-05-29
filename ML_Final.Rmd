@@ -1,0 +1,514 @@
+---
+title: "Final Project: Predicting High Risk Individuals for Ovarian Cancer Using NHANES
+  (1988-2018)"
+author: "YaYin Ruan"
+date: "2026-05-02"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+subtitle: "Option 2: Explore a provided dataset for pre-specified research goals (Category
+  D: Construct a prediction model to identify individuals with an outcome of interest
+  in an unseen dataset) | Dataset: W_NHANES"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+library(tidyverse)
+library(haven)        # read XPT/SAS files
+library(caret)        # train/test split, cross-validation
+library(glmnet)       # logistic regression
+library(randomForest)
+library(gbm)          # gradient boosting
+library(PRROC)        # PR-AUC
+library(pROC)         # ROC-AUC
+library(mice)         # imputation (optional, can use median too)
+library(doParallel)
+library(VIM)
+library(MLmetrics)
+library(Amelia)
+```
+
+# 1. Background
+
+Ovarian cancer is the fifth leading cause of cancer deaths among women. The difficulty surrounding ovarian cancer diagnosis poses great public health interests. Ovarian cancer early symptoms are non-specific, and patients/physicians may not connect the symptoms with ovarian cancer. This is evident as only 20% of diagnosis occur in the early stages (I and II), and diagnosis at the later stages have less optimistic outlooks with approximately 20% long term survival rate.Current machine learning models for ovarian cancer focus on pathology, imaging, and biopsy classification. Therefore we have a gap in research surrounding the use of machine learning and prediction of ovarian cancer outcome using population level data. This project aims to develop a population-level prediction model using NHANES data, that may be helpful in understanding an individual's risk of ovarian cancer. Difficulty surrounding the use of NHANES is that this is a cross sectional study, so there are no establishments in temporality, which limits the causal inference of this machine learning model. 
+
+# 2. Research Question (predictive question)
+Can we develop a machine learning prediction model to identify individuals with a high probability of ovarian cancer using demographic and clinical variables in NHANES (1988-2018)?
+
+
+## Step 1 (creating outcome)
+```{r outcome, echo=TRUE}
+load("NHANES.RData")
+
+# Creating final ovarian cancer outcome variable from participants who have either MCQ240S non-missing (age at ovarian cancer diagnosis) or those who answered MCQ220=1 (ever had cancer) AND any MCQ230 = 37 (ovarian)
+questionnaire_clean <- questionnaire_clean %>%
+  mutate(ovarian_mcq240s = as.integer(!is.na(MCQ240S)),
+    ovarian_mcq230 = as.integer(MCQ220 == 1 & (MCQ230A == 37 | MCQ230B == 37 | MCQ230C == 37 | MCQ230D == 37)),
+    ovarian_mcq230 = replace_na(ovarian_mcq230, 0),
+    ovarian_cancer = as.integer(ovarian_mcq240s == 1 | ovarian_mcq230 == 1)
+  )
+```
+
+```{r outcome-check, echo=FALSE}
+cat("Outcome distribution (0 = No ovarian cancer, 1 = Ovarian cancer):\n")
+table(questionnaire_clean$ovarian_cancer, useNA = "always")
+```
+From the entire NHANES dataset we have 252 participants with outcome (ovarian cancer)
+
+
+# Step 1.2 Predictors
+Predictors were selected based on established ovarian cancer risk factors from the epdimiological literature. 
+
+```{r features, echo=TRUE}
+# Recoding features of interest from questionnaire data set: Personal history of breast cancer (MCQ230A-D: code 14 = breast cancer), Nulliparity (never pregnant) (RHQ160: ever been pregnant (1=Yes, 2=No)), Early menarche (age at first period <= 11) (RHQ010: age at first menstrual period), Late menopause (age periods stopped >= 55) (RHD180: age periods stopped; RHQ031: still having periods (1=Yes)), Uterine_fibroid (RHQ380: Ever told by doctor that you had uterine fibroids),Endometriosis (RHQ570: ever told by doctor had endometriosis), Hormone replacement therapy (RHQ540: ever used female hormones (1=Yes, 2=No)), Oral contraceptive use (RHQ420: ever taken birth control pills (1=Yes, 2=No)), Smoking (HAR3)
+
+questionnaire_clean <- questionnaire_clean %>%
+  mutate(breast_cancer_hx = as.integer(MCQ230A == 14 | MCQ230B == 14 | MCQ230C == 14 | MCQ230D == 14),
+    breast_cancer_hx = replace_na(breast_cancer_hx, 0),
+    nulliparous = case_when(RHQ160 == 2 ~ 1L, RHQ160 == 1 ~ 0L, TRUE ~ NA_integer_),
+    early_menarche = case_when(RHQ010 %in% c(777, 999) ~ NA_integer_, RHQ010 <= 11 ~ 1L, RHQ010 > 11 ~ 0L, TRUE ~ NA_integer_),
+    menopausal_status = case_when(RHQ031 == 2 ~ 1L, RHQ031 == 1 ~ 0L, TRUE ~ NA_integer_
+),
+  uterine_fibroid = case_when(RHQ380 == 1 ~ 1L, RHQ380 == 2 ~ 0L, TRUE ~ NA_integer_),
+  endometriosis = case_when(RHQ570 == 1 ~ 1L, RHQ570 == 2 ~ 0L, TRUE ~ NA_integer_),
+  hrt = case_when(RHQ540 == 1 ~ 1L,RHQ540 == 2 ~ 0L, TRUE ~ NA_integer_),
+  oral_contraceptive = case_when(RHQ420 == 1 ~ 1L,RHQ420 == 2 ~ 0L, TRUE ~ NA_integer_),
+  smoking_questionnaire = case_when(HAR3 == 1 ~ 1L, HAR3 == 2 ~ 0L, TRUE ~ NA_integer_)
+  )
+```
+
+## Step 1.3 Merging data
+
+Four NHANES modules were merged by participant sequence number (SEQN) and checking for duplicate data
+
+```{r merge, echo=TRUE}
+#age, gender, ethnicity, poverty, education
+demo_dedup <- demographics_clean %>%
+  select(SEQN, RIDAGEYR, RIAGENDR, RIDRETH1, INDFMPIR, DMDEDUC2) %>%
+  group_by(SEQN) %>%
+  slice(1) %>%
+  ungroup()
+
+#overaian cancer outcome, breast cancer history, nulliparous, early menarche, meopausal status, uterine fibroid, endometriosis, hrt, oral contraceptive, smoking 
+quest_dedup <- questionnaire_clean %>%
+  select(SEQN, ovarian_cancer, breast_cancer_hx, nulliparous, early_menarche, menopausal_status, uterine_fibroid, endometriosis, hrt, oral_contraceptive, smoking_questionnaire) %>%
+  group_by(SEQN) %>%
+  slice(1) %>%
+  ungroup()
+
+#BMI and waist circumference
+response_dedup <- response_clean %>%
+  select(SEQN, BMXBMI, BMXWAIST) %>%
+  group_by(SEQN) %>%
+  slice(1) %>%
+  ungroup()
+
+#fat in diet
+dietary_dedup <- dietary_clean %>%
+  select(SEQN, DRXTTFAT) %>%
+  group_by(SEQN) %>%
+  slice(1) %>%
+  ungroup()
+
+#joining data and recoidng BMI data to create obesity predictor and creating high fat diet preidctor
+df <- quest_dedup %>%
+  left_join(demo_dedup, by = "SEQN") %>%
+  left_join(response_dedup, by = "SEQN") %>%
+  left_join(dietary_dedup, by = "SEQN") %>%
+  mutate(
+    obese = case_when(
+      BMXBMI >= 30 ~ 1L,
+      BMXBMI < 30 ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    high_fat_diet = as.integer(DRXTTFAT > quantile(DRXTTFAT, 0.75, na.rm = TRUE))
+  )
+
+
+# Verify no more duplicates
+cat("Unique SEQNs in df:", n_distinct(df$SEQN), "\n")
+cat("Total rows in df:", nrow(df), "\n")
+table(df$ovarian_cancer, useNA = "always")
+```
+
+## Step 1.5 Sample restriction
+
+The analytic sample was restricted to adult females aged 18 years and older with non-missing ovarian cancer outcome.
+
+```{r restriction, echo=TRUE}
+df <- df %>%
+  filter(
+    RIAGENDR == 2,
+    RIDAGEYR >= 18,
+    !is.na(ovarian_cancer)
+  ) %>%
+  mutate(across(where(is.numeric),
+                ~ ifelse(. %in% c(7, 9, 77, 99, 777, 999), NA, .)))
+```
+
+```{r restriction-check, echo=FALSE}
+cat("Cohort size:", nrow(df), "\n")
+cat("Ovarian cancer cases:", sum(df$ovarian_cancer), "\n")
+cat("Prevalence:", round(mean(df$ovarian_cancer) * 100, 3), "%\n")
+```
+
+Final total sample size after cleaning/restriction N = 31079, number of participants with outcome = 164, prevalence of ovarian cancer in dataset is 0.528
+
+## 3.6 Feature Selection and Missing Data
+
+```{r features-initial, echo=TRUE}
+features <- c(
+  "RIDAGEYR",
+  "breast_cancer_hx",
+  "nulliparous",
+  "early_menarche",
+  "menopausal_status",
+  "uterine_fibroid",
+  "endometriosis",
+  "hrt",
+  "oral_contraceptive",
+  "smoking_questionnaire",
+  "obese",
+  "BMXWAIST",
+  "high_fat_diet"
+)
+```
+
+```{r missingness-plot, echo=FALSE, fig.cap="Figure 1: Percentage of Missing Values by Predictor Variable"}
+df %>% missmap(main = "Missing values vs observed")
+```
+
+Uterine fibroid, endometriosis, and smoking exhibited high levels of missingness and were excluded from the final feature set. The remaining predictors were retained for imputation.
+
+```{r features-final, echo=TRUE}
+features <- c(
+  "RIDAGEYR",
+  "breast_cancer_hx",
+  "nulliparous",
+  "early_menarche",
+  "menopausal_status",
+  "hrt",
+  "oral_contraceptive",
+  "obese",
+  "BMXWAIST",
+  "high_fat_diet"
+)
+```
+
+
+## Step 2 Test/train data split
+Data were split into 70% training and 30% test sets using stratified sampling to preserve the outcome distribution.
+
+```{r split, echo=TRUE}
+set.seed(42)
+train_idx <- createDataPartition(df$ovarian_cancer, p = 0.70, list = FALSE)
+train_df <- df[train_idx, ]
+test_df  <- df[-train_idx, ]
+```
+
+```{r split-check, echo=FALSE}
+cat("Train size:", nrow(train_df), "| Ovarian cancer cases:", sum(train_df$ovarian_cancer), "\n")
+cat("Test size:", nrow(test_df),   "| Ovarian cancer cases:", sum(test_df$ovarian_cancer), "\n")
+```
+
+## Step 3 Imputation
+
+Missing values were imputed using k-nearest neighbor imputation (k=3) applied separately to the training and test sets. The outcome variable was excluded from imputation. 
+
+```{r imputation, echo=TRUE}
+train_outcome <- train_df$ovarian_cancer
+test_outcome  <- test_df$ovarian_cancer
+
+df_train_x <- train_df %>% select(all_of(features))
+df_test_x  <- test_df %>% select(all_of(features))
+
+set.seed(42)
+df_train_imp <- kNN(df_train_x, k = 3, imp_var = FALSE)
+df_test_imp  <- kNN(df_test_x,  k = 3, imp_var = FALSE)
+```
+
+## Step 3.1 Data preparation for training models
+
+Binary predictors were converted to factors. The outcome variable was added back after imputation.
+
+```{r preparation, echo=TRUE}
+
+#adding predictor back
+df_train_model <- df_train_imp %>%
+mutate(ovarian_cancer = factor(train_outcome, levels = c(0, 1), labels = c("No", "Yes")))
+
+df_test_model <- df_test_imp %>%
+mutate(ovarian_cancer = factor(test_outcome, levels = c(0, 1), labels = c("No", "Yes")))
+
+#check
+df_test_model %>%
+  missmap(main = "Missing values vs observed")
+df_train_model %>%
+  missmap(main = "Missing values vs observed")
+
+#Convert binary/categorical variables to factors
+df_train_model <- df_train_model %>%
+  mutate(
+    # Binary predictors
+    across(c(breast_cancer_hx, nulliparous, early_menarche,
+             hrt, oral_contraceptive, menopausal_status, obese, high_fat_diet),
+           ~ factor(round(.), levels = c(0, 1), labels = c("No", "Yes")))
+    
+  )
+
+
+cat("\nImputation complete. Dataset dimensions:", dim(df_train_model), "\n")
+cat("Ovarian cancer cases:", sum(df_train_model$ovarian_cancer == "Yes"), "\n")
+
+#Convert to factors for test dataset
+df_test_model <- df_test_model %>%
+  mutate(
+    # Binary predictors
+    across(c(breast_cancer_hx, nulliparous, early_menarche,
+             hrt, oral_contraceptive,obese, menopausal_status, high_fat_diet),
+           ~ factor(round(.), levels = c(0, 1), labels = c("No", "Yes")))
+  )
+
+
+cat("\nImputation complete. Dataset dimensions:", dim(df_test_model), "\n")
+cat("Ovarian cancer cases:", sum(df_test_model$ovarian_cancer == "Yes"), "\n")
+
+
+X_train <- df_train_model %>% select(all_of(features))
+y_train <- df_train_model$ovarian_cancer
+
+X_test  <- df_test_model %>% select(all_of(features))
+y_test  <- df_test_model$ovarian_cancer
+
+
+#Train size: 21756 | Positives: 119, Test size: 9323 | Positives: 45  
+```
+
+```{r preparation-check, echo=FALSE}
+#Checking the distirbution of outcomes in test and train dataset
+cat("\nTrain size:", nrow(train_df), "| Positives:", sum(df_train_model$ovarian_cancer == "Yes"), "\n")
+cat("Test size:", nrow(df_test_model), "| Positives:", sum(df_test_model$ovarian_cancer == "Yes"), "\n")
+```
+After split, train data set has 119 cases, and test data set has 45 cases
+
+
+## Step 4 Cross-Validation Setup
+
+Given the low prevalence of ovarian cancer (~0.5%), upsampling was applied to address imbalance. Five-fold cross-validation was used to evaluate and tune all models. The primary optimization metric was PR-AUC, which is more appropriate than ROC-AUC for severely imbalanced outcomes.
+
+```{r cv-setup, echo=TRUE}
+cv_ctrl_up <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = prSummary,    #Note: prSummary - AUC represents PR-AUC
+  savePredictions = "final",
+  sampling        = "up"          # upsampling applied within each fold
+)
+
+# Parallel processing speed up the training 
+cl <- makePSOCKcluster(detectCores() - 1)
+registerDoParallel(cl)
+```
+
+
+
+## Step 5 Logistic Regression
+
+```{r lr, echo=TRUE}
+set.seed(42)
+table(df_train_model$ovarian_cancer, useNA = "always")
+cat("\nTraining Logistic Regression with Upsampling...\n")
+lr_model <- train( ovarian_cancer ~., data = df_train_model,
+  method    = "glm",
+  metric = "AUC",
+  trControl = cv_ctrl_up,
+  preProcess = c("center","scale"))
+```
+
+```{r lr-results, echo=FALSE}
+lr_model$results
+coef(lr_model$finalModel)
+```
+
+PR-AUC = 0.9975, which indicates almost perfect classification from logistic regression training model. The sensitivity of 0.646 indicates the model correctly identified approximately 65% of ovarian cancer cases during training, suggesting moderate ability to detect true positives. The most important predictors are menopausal status, breast cancer history, and hormone replace history. 
+
+## Step 5.2 Random Forest
+
+Random Forest was tuned over a sequence of mtry values (number of variables tried at each split) tuning using 100 and 500 trees.
+```{r rf, echo=TRUE}
+#Create grid of values for hypertuning random forest models, sequence of numbers up to X_train (13 features)
+mtry.grid <- expand.grid(.mtry = seq(2, ncol(X_train), by = 2))
+
+#RF with 100 trees
+set.seed(42)
+rf_model <- train(
+  ovarian_cancer ~., data = df_train_model,
+  method    = "rf",
+  metric    = "AUC",
+  trControl = cv_ctrl_up,
+  tuneGrid=mtry.grid, ntree=100
+)
+```
+
+```{r rf-results, echo=FALSE}
+rf_model$bestTune #best tune mtry = 2 #AUC = 0.88618614	
+rf_model$finalModel
+```
+
+```{r rf-importance, echo=FALSE, fig.cap="Figure 2: Random Forest Feature Importance"}
+plot(varImp(rf_model)) #age, waistcircumference, and menopause status
+```
+From random forest model with ntrees = 100, the best mtry = 2 (2 randomly selected variables were considered at each tree split). PR-AUC = 0.88618614 which indicates strong ability of the model in correct classification with sensitivity of 0.7367, or 73.67% chance in identifying true positives. The most important variables are age, waist circumference, and menopause status in predicting ovarian cancer.
+
+Random Forest with 500 trees
+```{r rf2, echo=TRUE}
+set.seed(42)
+rf_model2 <- train(
+  ovarian_cancer ~., data = df_train_model,
+  method    = "rf",
+  metric    = "AUC",
+  trControl = cv_ctrl_up,
+  tuneGrid=mtry.grid, ntree =500
+)
+```
+
+```{r rf-results2, echo=FALSE}
+rf_model2$bestTune #Best tune (mtry = 2, AUC = 0.9578248)	
+rf_model2$finalModel
+```
+
+```{r rf-importance2, echo=FALSE, fig.cap="Figure 2: Random Forest Feature Importance"}
+plot(varImp(rf_model2)) #age, waistcircumference, and menopause status
+```
+From random forest model with ntrees = 500, the best mtry = 2 (2 randomly selected variables were considered at each tree split). PR-AUC = 0.9578248 which indicates almost perfect classification with sensitivity of 0.7295369, or 72.95% chance in identifying true positives. Random forest with 500 trees has better PR-AUC, therefore will proceed forward with parameter of 500 trees. The most important variables are age, waist circumference, and menopause status in predicting ovarian cancer.
+
+## 5.3 Gradient Boosting
+
+Gradient Boosting was tuned over combinations of number of trees, interaction depth, and shrinkage rate.
+
+```{r gbm, echo=TRUE}
+set.seed(42)
+
+#tuning grid: trees, shrinkage, depth, minimum number of observations in trees' terminal node
+gbm.hyp<-expand.grid(n.trees=(0:10)*100, shrinkage=c(0.01, 0.001), interaction.depth=c(1,3), n.minobsinnode=10)
+
+#GBM model
+gbm_model <- train(
+  ovarian_cancer ~., data = df_train_model,
+  method    = "gbm",
+  metric    = "AUC",
+  trControl = cv_ctrl_up,
+ distribution="bernoulli", verbose=F, tuneGrid=gbm.hyp
+)
+
+stopCluster(cl)
+```
+
+```{r gbm-results, echo=FALSE}
+cat("Best GBM hyperparameters:\n")
+print(gbm_model$bestTune)
+```
+
+```{r gbm-importance, echo=FALSE, fig.cap="Figure 3: Gradient Boosting Feature Importance"}
+plot(varImp(gbm_model))
+```
+Hyperparameter tuning identified the optimal Gradient Boosting configuration as 900 trees with an interaction depth of 3, a shrinkage rate of 0.01, and a minimum of 10 observations per terminal node. Identified all predictors are important. The training PR-AUC is 0.9975 or near perfect classification in the training dataset and a sensitivity of 69.01% or 69.01% chance in identifying true positives.  
+
+
+## Step 6: Cross-Validation Performance
+
+All three models were compared on PR-AUC and sensitivity. 
+
+```{r cv-comparison, echo=FALSE}
+cv_results <- resamples(list(
+  LogisticRegression = lr_model,
+  RandomForest       = rf_model2,
+  GradientBoosting   = gbm_model
+))
+
+cv_summary <- data.frame(
+  Model = c("Logistic Regression", "Random Forest", "Gradient Boosting"),
+  PR_AUC_mean = round(c(mean(cv_results$values$`LogisticRegression~AUC`),
+                         mean(cv_results$values$`RandomForest~AUC`),
+                         mean(cv_results$values$`GradientBoosting~AUC`)), 4),
+  PR_AUC_sd   = round(c(sd(cv_results$values$`LogisticRegression~AUC`),
+                         sd(cv_results$values$`RandomForest~AUC`),
+                         sd(cv_results$values$`GradientBoosting~AUC`)), 4),
+  Sensitivity_mean = round(c(mean(cv_results$values$`LogisticRegression~Recall`),
+                              mean(cv_results$values$`RandomForest~Recall`),
+                              mean(cv_results$values$`GradientBoosting~Recall`)), 4),
+  Sensitivity_sd   = round(c(sd(cv_results$values$`LogisticRegression~Recall`),
+                              sd(cv_results$values$`RandomForest~Recall`),
+                              sd(cv_results$values$`GradientBoosting~Recall`)), 4)
+)
+
+knitr::kable(cv_summary, 
+             caption = "Table 1: 5-Fold Cross-Validation Results (Mean ± SD)",
+             col.names = c("Model", "PR-AUC Mean", "PR-AUC SD", 
+                           "Sensitivity Mean", "Sensitivity SD"))
+```
+
+```{r cv-plots, echo=FALSE, fig.cap="Figure 4: Cross-Validation PR-AUC and Sensitivity Comparison"}
+dotplot(cv_results, metric = "AUC",    main = "PR-AUC Comparison (5-Fold CV)")
+dotplot(cv_results, metric = "Recall", main = "Sensitivity Comparison (5-Fold CV)")
+```
+
+Gradient Boosting and Logistic Regression achieved similar PR-AUC during cross-validation, both outperforming Random Forest. However, gradient Boosting demonstrated higher sensitivity and was therefore selected as the final model for test set evaluation because it is better at identifying true positives.
+
+## Step 7: test set evaluation
+
+The Gradient Boosting model was evaluated on the test set using the best hyperparameters identified during cross validation (n.trees = 1000, interaction.depth = 3, shrinkage = 0.01, n.minobsinnode = 10).
+
+```{r test-default, echo=FALSE}
+gbm_probs <- predict(gbm_model, X_test, type = "prob")[, "Yes"]
+gbm_preds <- predict(gbm_model, X_test)
+
+cm_gbm  <- caret::confusionMatrix(gbm_preds, y_test, positive = "Yes")
+pr_gbm  <- pr.curve(scores.class0 = gbm_probs[y_test == "Yes"],
+                    scores.class1 = gbm_probs[y_test == "No"],
+                    curve = TRUE)
+roc_gbm <- pROC::roc(response = y_test, predictor = gbm_probs, quiet = TRUE)
+
+results_default <- data.frame(
+  Metric = c("PR-AUC", "ROC-AUC", "Sensitivity", 
+             "Specificity", "Balanced Accuracy", "Precision", "F1"),
+  Value  = round(c(pr_gbm$auc.integral,
+                   as.numeric(pROC::auc(roc_gbm)),
+                   cm_gbm$byClass["Sensitivity"],
+                   cm_gbm$byClass["Specificity"],
+                   cm_gbm$byClass["Balanced Accuracy"],
+                   cm_gbm$byClass["Precision"],
+                   cm_gbm$byClass["F1"]), 4)
+)
+
+knitr::kable(results_default,
+             caption = "Table 2: GBM Test Set Results — Default Threshold (0.5)")
+
+knitr::kable(cm_gbm$table,
+             caption = "Table 3: Confusion Matrix — Default Threshold (0.5)")
+```
+
+# Discussion
+
+## Key Findings
+
+The gradient boosting model was the best performing alogrithm from the three algorithms analyzed in this project (logistic regression, random forest, and gradient boosting ) because it has the highest PR-AUC (metric that measures accuracy less affected by imbalanced dataset than ROC-AUC) and higher sensitivity in comparison to random forest that has the same PR-AUC performance. From the GBM, the three main predictors of ovarian cancer is age, waist circumference, and menopause, and all 10 predictors included are significant. When evaluated in the testing dataset, the PR-AUC (0.0150) is much lower than the training PR-AUC (0.9975), however sensitivity remain around the same ~0.60, which means it has 60% chance of identifying true positives (ovarian cancers). Additionally, the balanced accuracy is greater than 50% (balanced accuracy = 63.72%), this indicates at the minimum the test performs better than random chances in distinguishing women at high risk from those not at risk of ovarian cancer given the predictors. Additionally, the GBM model when evaluated had 60% sensitivity, indicating the model has a 60% chance in identifying true positives.
+
+
+
+## Limitations
+Missing other risk factors such as BRCA1/2 genes, which NHANES does not collect information on and family history of ovarian cancer. Cross sectional nature of the data and machine learning models, indicates low causal inferences. The lack of temporality also indicates that this can not be used as a screening tool. Secondly, the algorithms are trained from data that have been imputed and upsampled, so the metrics of PR-AUC from training were highly inflated, which reduces credibility of the models. Secondly, data are self reports which is prone to recall bias.
+
+## Conclusion
+
+This study demonstrates the feasibility of using population-level NHANES data to identify individuals at elevated ovarian cancer risk. The Gradient Boosting model achieved a sensitivity of 0.60 or 60% chance of identifying true positives in datasets. However, the strength of the final GBM model is weak as the balanced accuracy is only 63.72%, better than random chance but not very strong and very low PR-AUC. Very importantly, the nature of cross sectional study, indicates that this can not be used as a screening tool, but it might serve as supplemental risk stratification tool if further developed in future studies using more robust dataset. 
+
+Disclaimer: Claude AI was utilized to trouble shoot coding
