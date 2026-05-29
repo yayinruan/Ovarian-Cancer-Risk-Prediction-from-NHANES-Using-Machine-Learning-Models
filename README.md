@@ -1,11 +1,11 @@
 # Ovarian-Cancer-Risk-Prediction-from-NHANES-Using-Machine-Learning-Models
 Developed a machine learning pipeline and models in R to predict ovarian cancer risk using 30 years of population-level NHANES (1988 - 2018) data with 100,000+ participants
-Key Findings
+Key Findings:
 The gradient boosting model was the best performing alogrithm from the three algorithms analyzed in this project (logistic regression, random forest, and gradient boosting ) because it has the highest PR-AUC (metric that measures accuracy less affected by imbalanced dataset than ROC-AUC) and higher sensitivity in comparison to random forest that has the same PR-AUC performance. From the GBM, the three main predictors of ovarian cancer is age, waist circumference, and menopause, and all 10 predictors included are significant. When evaluated in the testing dataset, the PR-AUC (0.0150) is much lower than the training PR-AUC (0.9975), however sensitivity remain around the same ~0.60, which means it has 60% chance of identifying true positives (ovarian cancers). Additionally, the balanced accuracy is greater than 50% (balanced accuracy = 63.72%), this indicates at the minimum the test performs better than random chances in distinguishing women at high risk from those not at risk of ovarian cancer given the predictors. Additionally, the GBM model when evaluated had 60% sensitivity, indicating the model has a 60% chance in identifying true positives.
 
-Limitations
+Limitations:
 Missing other risk factors such as BRCA1/2 genes, which NHANES does not collect information on and family history of ovarian cancer. Cross sectional nature of the data and machine learning models, indicates low causal inferences. The lack of temporality also indicates that this can not be used as a screening tool. Secondly, the algorithms are trained from data that have been imputed and upsampled, so the metrics of PR-AUC from training were highly inflated, which reduces credibility of the models. Secondly, data are self reports which is prone to recall bias.
 
-Conclusion
+Conclusion:
 This study demonstrates the feasibility of using population-level NHANES data to identify individuals at elevated ovarian cancer risk. The Gradient Boosting model achieved a sensitivity of 0.60 or 60% chance of identifying true positives in datasets. However, the strength of the final GBM model is weak as the balanced accuracy is only 63.72%, better than random chance but not very strong and very low PR-AUC. Very importantly, the nature of cross sectional study, indicates that this can not be used as a screening tool, but it might serve as supplemental risk stratification tool if further developed in future studies using more robust dataset.
 
